@@ -93,16 +93,16 @@ That's the entire integration. Behind those two lines: a four-engine security pi
   |  Agent --> evaluateTrade(request) --> GUARDIAN ORCHESTRATOR   |
   |                                                              |
   |  +--------------+ +--------------+ +-------------+ +--------+|
-  |  | TOKEN RISK   | | TX SIM       | | MEV         | | AMM    ||
-  |  | (30%)        | | + FUZZING    | | DETECTION   | | POOL   ||
+  |  | TOKEN RISK   | | TX           | | MEV         | | AMM    ||
+  |  | (30%)        | | SIMULATION   | | DETECTION   | | POOL   ||
   |  |              | | (30%)        | | (15%)       | | (25%)  ||
-  |  | Honeypot     | | eth_call     | | Sandwich    | | Thin   ||
-  |  | Tax scan     | | dry-run      | | Frontrun    | | liq.   ||
-  |  | Blacklist    | | OKX cross-   | | Private     | | Tick   ||
-  |  | Mint fn      | | validation   | | MEV flow    | | gap    ||
-  |  | Holders      | | 8-variant    | | Builder     | | Price  ||
-  |  | GoPlus API   | | invariant    | | toxicity    | | dev.   ||
-  |  | OKX API      | | fuzzer       | | Dyn. slip   | | 1-side ||
+  |  | Honeypot     | | eth_call     | | Trade-size  | | Thin   ||
+  |  | Tax scan     | | dry-run      | | heuristic   | | liq.   ||
+  |  | Blacklist    | | OKX cross-   | | Dynamic     | | Tick   ||
+  |  | Mint fn      | | validation   | | slippage    | | gap    ||
+  |  | Holders      | |              | | cap         | | Price  ||
+  |  | GoPlus API   | |              | |             | | dev.   ||
+  |  | OKX API      | |              | |             | | 1-side ||
   |  +------+-------+ +------+-------+ +------+------+ +---+----+|
   |         |                |                |             |     |
   |         +----------------+----------------+-------------+     |
@@ -130,15 +130,19 @@ Calls **two independent security oracles** for every token. Not one — two. The
 
 What it detects: **honeypots, hidden sell taxes, blacklist wallet functions, unlimited mint capabilities, unverified contracts, low holder counts (rug-pull indicators), ownership not renounced.**
 
-### Engine 2 — TX Simulation + Fuzzing (`30% weight`)
-*eth_call → OKX cross-validation → 8-variant invariant fuzzer*
+### Engine 2 — TX Simulation (`30% weight`)
+*eth_call dry-run → OKX Security API cross-validation*
 
-Simulates the transaction **three times over**: first with `eth_call` on X Layer's RPC, then cross-validated against OKX's independent pre-execution scanner. If they produce different results — the trade is blocked. Then comes the **invariant fuzzer**: 8 calldata mutation variants (zero-args, max-uint256, half/double/10x amounts, byte-flip, truncation) are thrown at the contract to find state-dependent traps that only trigger under specific conditions. Static analysis misses these. We don't.
+Simulates the transaction via `eth_call` on X Layer's RPC, pinned to a specific block number for deterministic results. The simulation detects reverts before the transaction hits the mempool — saving the agent from wasting gas on a doomed transaction — and computes exact slippage by decoding the return data against the agent's expected output. In parallel, the OKX Security API's transaction-scan endpoint provides an independent second opinion on the transaction's safety, flagging known drainer contracts, suspicious approval patterns, and phishing attempts that pure `eth_call` cannot detect. If the OKX API is unavailable, the pipeline degrades gracefully to RPC-only results rather than blocking outright — the OKX cross-check is additive confidence, not a hard dependency.
+
+What it detects: **transaction reverts (with gas waste calculation), excessive slippage, OKX-flagged drainer contracts, suspicious state changes, elevated gas costs.**
 
 ### Engine 3 — MEV Detection (`15% weight`)
-*Private flow awareness + builder toxicity tracking*
+*Deterministic trade-impact heuristic with dynamic slippage caps*
 
-Mempool analysis isn't enough anymore. Private MEV via Flashbots-style bundles is **invisible to standard mempool scans**. Guardian tracks builder toxicity per-block using an LRU cache (256 builders, 1hr TTL), estimates private MEV flow exposure, and computes a **dynamic slippage cap** that automatically tightens under volatile or toxic conditions. An agent running with a static 0.5% slippage in a MEV-toxic environment is an agent getting extracted from.
+This analyzer operates deterministically on available quote data and does **not** perform live mempool WebSocket scanning. Instead of attempting unreliable mempool observation, it focuses on what it can control: hardening the transaction's execution parameters to make MEV extraction mathematically unprofitable. The engine computes a **dynamic slippage cap** based strictly on the USD size of the trade — larger trades receive tighter caps because they present more profitable sandwich targets. Trades over $1,000 get a 25% tighter slippage cap; trades over $10,000 get a 50% tighter cap. The result is a recommended maximum slippage tolerance that the agent should enforce, along with a trade-impact assessment (`negligible`, `moderate`, `significant`, `extreme`) that quantifies the trade's vulnerability to extraction.
+
+What it detects: **sandwich attack profitability (via slippage exposure), frontrunning risk at trade size, trade-size impact assessment, recommended MEV protection.**
 
 ### Engine 4 — AMM Pool Analyzer (`25% weight`)
 *On-chain concentrated liquidity state reads*
@@ -171,9 +175,8 @@ This is the analyzer that no other tool has. It reads the **raw on-chain state**
    │   • RPC unreachable     → Failover  → BLOCK if all │
    │   • Unknown token       → Score 0   → BLOCK        │
    │   • OKX ≠ eth_call      → Penalty   → Likely BLOCK │
-   │   • Fuzzer finds trap   → Flag      → BLOCK        │
    │   • Zero tick liquidity → CRITICAL  → BLOCK        │
-   │   • Builder toxicity ↑  → Slippage ↓→ May BLOCK   │
+   │   • High slippage cap   → Slippage ↓→ May BLOCK   │
    └────────────────────────────────────────────────────┘
 ```
 
@@ -351,8 +354,8 @@ npm run live-fire          # End-to-end test against X Layer Mainnet (Chain ID 1
 | Suite | Tests | What's Covered |
 |-------|-------|----------------|
 | `token-risk.test.ts` | 9 | Honeypot, blacklist, mint, tax, API failure → fail-closed |
-| `tx-simulation.test.ts` | 13 | Revert, slippage, OKX cross-validation, 8-variant fuzzing, degradation |
-| `mev-detection.test.ts` | 10 | Sandwich patterns, volatility, private flow, dynamic slippage, builder toxicity |
+| `tx-simulation.test.ts` | 13 | Revert detection, slippage via eth_call return data, OKX cross-validation (action:block/warn), graceful degradation, RPC failure → fail-closed, quick revert check, slippage edge cases |
+| `mev-detection.test.ts` | 10 | Trade-size impact assessment, dynamic slippage cap computation, custom thresholds, score boundaries, report structure, error handling |
 | `amm-pool-analyzer.test.ts` | 13 | Thin liquidity, tick gaps, price deviation, one-sided, score bounds |
 | `risk-engine.test.ts` | 27 | Weighted scoring, all 3 AMM correlations, confidence, penalties, sub-score floors |
 | **Total** | **72** | **100% passing ✅** |
@@ -370,13 +373,12 @@ The test suite is adversarial. It doesn't just test the happy path — it tests 
 | Cache hit response | **< 1ms** | LRU cache serves repeat evaluations instantly |
 | Cache TTL | **60 seconds** | Fresh enough for DeFi conditions |
 | Cache capacity | **500 entries** | Handles high-frequency agent loops |
-| Fuzzing variants | **8 per tx** | Mutation strategies covering all known trap patterns |
 
 Agents running in evaluation loops never hit rate limits. The OKX API client wraps all requests in a 60-second LRU cache. The same token evaluated 50 times in a minute hits the API once.
 
 ---
 
-## 🔍 Risk Flags Reference (30+ Signals)
+## 🔍 Risk Flags Reference
 
 | Category | Flag Code | Severity | What It Means |
 |----------|-----------|----------|---------------|
@@ -389,12 +391,9 @@ Agents running in evaluation loops never hit rate limits. The OKX API client wra
 | **Token** | `LOW_HOLDER_COUNT` | 🟡 MEDIUM | Centralized distribution — rug-pull precursor |
 | **TX Sim** | `TX_SIMULATION_REVERTED` | 🔴 CRITICAL | Transaction will fail on-chain — 100% wasted gas |
 | **TX Sim** | `HIGH_PRICE_IMPACT` | 🟠 HIGH | Slippage beyond your tolerance |
-| **TX Sim** | `FUZZING_INVARIANT_VIOLATION` | 🟠 HIGH | Hidden state-dependent revert trap discovered |
-| **TX Sim** | `UNEXPECTED_STATE_CHANGE` | 🟡 MEDIUM | Suspicious token balance mutation |
-| **TX Sim** | `GAS_ESTIMATION_FAILED` | 🟡 MEDIUM | Contract behaves unexpectedly during gas estimation |
-| **MEV** | `SANDWICH_ATTACK_LIKELY` | 🟠 HIGH | Bots can profitably sandwich this trade |
-| **MEV** | `FRONTRUN_RISK_HIGH` | 🟠 HIGH | Frontrunning is profitable at this trade size |
-| **MEV** | `PRIVATE_MEV_FLOW_HIGH` | 🟡 MEDIUM | High invisible MEV via private builder bundles |
+| **TX Sim** | `UNEXPECTED_STATE_CHANGE` | 🟠 HIGH | OKX cross-validation flagged suspicious transaction behavior |
+| **TX Sim** | `GAS_ESTIMATION_FAILED` | 🟡 MEDIUM | Elevated gas cost or estimation failure |
+| **MEV** | `FRONTRUN_RISK_HIGH` | 🟠 HIGH | Slippage tolerance makes this trade profitable for sandwich bots |
 | **AMM** | `AMM_THIN_LIQUIDITY` | 🔴 CRITICAL | Zero or near-zero liquidity at execution price |
 | **AMM** | `AMM_TICK_GAP_MANIPULATION` | 🟠 HIGH | Price cliff created by strategic liquidity removal |
 | **AMM** | `AMM_PRICE_DEVIATION` | 🟡 MEDIUM | Pool price deviates from its theoretical fair value |
@@ -411,8 +410,8 @@ guardian-protocol/
 │   ├── cli.ts                        # Agent CLI — JSON-only output, 3 commands
 │   ├── analyzers/
 │   │   ├── token-risk.ts             # OKX + GoPlus dual-oracle honeypot/tax/blacklist detection
-│   │   ├── tx-simulation.ts          # eth_call + OKX cross-validation + 8-variant invariant fuzzer
-│   │   ├── mev-detection.ts          # Sandwich + private flow + builder toxicity + dynamic slippage
+│   │   ├── tx-simulation.ts          # eth_call dry-run + OKX cross-validation
+│   │   ├── mev-detection.ts          # Deterministic trade-impact heuristic + dynamic slippage caps
 │   │   └── amm-pool-analyzer.ts      # On-chain concentrated liquidity pool state analysis
 │   ├── scoring/
 │   │   ├── risk-engine.ts            # Weighted aggregation + penalty cascades + correlation detection
@@ -422,7 +421,7 @@ guardian-protocol/
 │   │   └── xlayer-rpc-client.ts      # Round-robin RPC manager (3 endpoints, 500ms failover)
 │   ├── types/
 │   │   ├── input.ts                  # GuardianEvaluationRequest schema
-│   │   ├── output.ts                 # GuardianEvaluationResponse + SafetyScore + 30+ RiskFlagCodes
+│   │   ├── output.ts                 # GuardianEvaluationResponse + SafetyScore + RiskFlagCodes
 │   │   ├── internal.ts               # AnalyzerResult inter-module contract
 │   │   └── okx-api.ts                # OKX API response type definitions
 │   └── utils/
@@ -456,7 +455,7 @@ guardian-protocol/
 | `XLAYER_RPC_URL_3` | ➖ | Tertiary RPC for failover |
 | `GUARDIAN_SAFETY_THRESHOLD` | ➖ | Override block threshold (default: `70`) |
 | `GUARDIAN_MAX_SLIPPAGE_BPS` | ➖ | Max allowed slippage in bps (default: `500`) |
-| `GUARDIAN_TX_SIMULATION_TIMEOUT_MS` | ➖ | Simulation + fuzz timeout (default: `10000`) |
+| `GUARDIAN_TX_SIMULATION_TIMEOUT_MS` | ➖ | Simulation timeout (default: `10000`) |
 | `GUARDIAN_RPC_ENDPOINT_TIMEOUT_MS` | ➖ | Per-endpoint failover budget (default: `500`) |
 
 ---
@@ -469,8 +468,8 @@ See [CHANGELOG.md](./CHANGELOG.md) for full history.
 - 🆕 **Dual-oracle token scanning** — OKX Security API + GoPlus Security cross-validation
 - 🆕 **AMM Pool Analyzer** — On-chain concentrated liquidity manipulation detection (4th engine)
 - 🆕 **RPC Redundancy** — 3-endpoint round-robin with health-based failover
-- 🆕 **TX Simulation Fuzzing** — 8-variant invariant testing engine
-- 🆕 **Dynamic Slippage Caps** — Computed on the fly based on trade impact.
+- 🆕 **TX Simulation Cross-Validation** — eth_call + OKX transaction-scan dual verification
+- 🆕 **Dynamic Slippage Caps** — Computed deterministically based on trade size in USD
 - 🆕 **Risk Engine Rebalancing** — 4-analyzer weights (30/30/15/25)
 - 🆕 **Cross-Analyzer Correlations** — 3 compound penalty detectors
 - 🆕 **72 tests** — Up from 50, all passing
